@@ -4,36 +4,54 @@ import math
 import os
 import random
 import shutil
-
+from contextlib import nullcontext
+from pathlib import Path
+import accelerate
 import datasets
-from PIL import Image
+import numpy as np
 import torch
 import torch.nn.functional as F
-import numpy as np
-
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
+from src.flux.sampling import unpack
 from accelerate.logging import get_logger
-from accelerate.utils import ProjectConfiguration, DistributedDataParallelKwargs
+from src.flux.sampling import denoise_controlnet_mix
+from accelerate.state import AcceleratorState
+from accelerate.utils import ProjectConfiguration, set_seed
+from huggingface_hub import create_repo, upload_folder
+from packaging import version
 from tqdm.auto import tqdm
+from transformers import CLIPTextModel, CLIPTokenizer
+from transformers.utils import ContextManagers
 from omegaconf import OmegaConf
 from copy import deepcopy
+from src.dataset.hoivideodataset import get_train_set,get_valid_set
 import diffusers
+from diffusers import AutoencoderKL, DDPMScheduler
+from src.flux.xflux_pipeline import XFluxSampler
 from diffusers.optimization import get_scheduler
-from diffusers.utils import is_wandb_available
+from diffusers.training_utils import EMAModel, compute_dream_and_update_latents, compute_snr
+from diffusers.utils import check_min_version, deprecate, is_wandb_available, make_image_grid
+from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
+from diffusers.utils.import_utils import is_xformers_available
+from diffusers.utils.torch_utils import is_compiled_module
 from einops import rearrange
-from src.flux.xflux_pipeline_depth import XFluxSampler
-from src.flux.sampling import prepare
-from src.flux.util import (load_ae, load_clip,
-                       load_flow_model2, load_controlnet, load_t5)
-# from image_datasets.canny_dataset import loader
-from image_datasets.depth_dataset import loader
-
-
-if is_wandb_available():
-    import wandb
+from src.flux.sampling import denoise, get_noise, get_schedule, prepare, unpack,get_schedule
+from src.flux.util import (configs, load_ae, load_clip,
+                       load_flow_model2, load_controlnet, load_controlnet_extend,load_t5,load_checkpoint)
+from image_datasets.canny_dataset import loader
+import wandb
+from src.dataset import get_dataloader
+from src.dataset.hoivideodataset import HOIVideoDatasetResizing
 logger = get_logger(__name__, log_level="INFO")
 
+def get_loss(gt,pred,front_mask,back_weight=0.3):
+    weight_vector=torch.ones_like(gt,dtype=gt.dtype,device=gt.device)
+    weight_vector[~front_mask]=back_weight
+    return F.mse_loss(weight_vector*gt,weight_vector*pred)
 
 def get_models(name: str, device, offload: bool, is_schnell: bool):
     t5 = load_t5(device, max_length=256 if is_schnell else 512)
@@ -41,7 +59,6 @@ def get_models(name: str, device, offload: bool, is_schnell: bool):
     model = load_flow_model2(name, device="cpu")
     vae = load_ae(name, device="cpu" if offload else device)
     return model, vae, t5, clip
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -53,27 +70,36 @@ def parse_args():
         help="path to config",
     )
     args = parser.parse_args()
-
     return args.config
 
+def get_down_mask(valid_up_mask, downsample_factor):
+    invalid_mask = ~valid_up_mask
+    vae_scale_factor = downsample_factor
+    valid_mask_down = ~torch.max_pool2d(
+                            invalid_mask.float(), 
+                            vae_scale_factor,
+                            vae_scale_factor
+                        ).bool()
+    valid_mask_down=rearrange(valid_mask_down, "b ch (h ph) (w pw) -> b (h w) (ch ph pw)", ph=2, pw=2)
+    valid_mask_down = valid_mask_down.repeat((1, 1, 16))
+    return valid_mask_down
 
 def main():
-
+    wandb.login(key="3c0494971d81213bb5632623cb4d3ea5127c231b")
+    # torch.serialization._is_allowed = lambda *args, **kwargs: True
     args = OmegaConf.load(parse_args())
     is_schnell = args.model_name == "flux-schnell"
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
-
+    change_world_size = True
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
         project_config=accelerator_project_config,
-        kwargs_handlers=[ddp_kwargs],
     )
-
+    AcceleratorState().deepspeed_plugin.deepspeed_config['train_micro_batch_size_per_gpu']=args.train_batch_size
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -90,27 +116,24 @@ def main():
         transformers.utils.logging.set_verbosity_error()
         diffusers.utils.logging.set_verbosity_error()
 
+
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
     print("DEVICE", accelerator.device)
-    device = accelerator.device
-    dit, vae, t5, clip = get_models(name=args.model_name, device=device, offload=False, is_schnell=is_schnell)
-
+    dit, vae, t5, clip = get_models(name=args.model_name, device=accelerator.device, offload=False, is_schnell=is_schnell)
     vae.requires_grad_(False)
     t5.requires_grad_(False)
     clip.requires_grad_(False)
     dit.requires_grad_(False)
     dit.to(accelerator.device)
-
-    controlnet = load_controlnet(name=args.model_name, device=accelerator.device, transformer=dit)
-    controlnet = controlnet.to(torch.float32)
+    controlnet = load_controlnet(name=args.model_name, device=accelerator.device, transformer=dit,depth=args.depth)
     controlnet.train()
 
     optimizer_cls = torch.optim.AdamW
 
-    print(sum([p.numel() for p in controlnet.parameters() if p.requires_grad]) / 1e9, 'B parameters')
+    print(sum([p.numel() for p in controlnet.parameters() if p.requires_grad]) / 1000000, 'parameters')
     optimizer = optimizer_cls(
         [p for p in controlnet.parameters() if p.requires_grad],
         lr=args.learning_rate,
@@ -119,15 +142,16 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    train_dataloader = loader(**args.data_config)
-
-    val_depth_path = '~/work/dev6/DiffusionAsShader/data/bridge/renderings/points/val/2/frame_0000.npy'
-    val_depth = np.load(val_depth_path)
-    val_prompt = ''
-    val_sample = {
-        'val_depth': val_depth,
-        'val_prompt': val_prompt,
-    }
+    dataset = get_train_set()
+    validset = get_valid_set()
+    if accelerator.is_main_process:
+        valid_data=[validset[4],validset[14],validset[24],validset[34]]
+    train_dataloader=DataLoader(
+        dataset,
+        batch_size=3,
+        shuffle=True,
+        num_workers=8,
+    )
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -145,18 +169,19 @@ def main():
     first_epoch = 0
 
     # Potentially load in the weights and states from a previous save
-    controlnet, optimizer, _, lr_scheduler = accelerator.prepare(
+    controlnet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         controlnet, optimizer, deepcopy(train_dataloader), lr_scheduler
     )
-
-    weight_dtype = torch.float32
+    weight_dtype=torch.float32
     if accelerator.mixed_precision == "fp16":
         weight_dtype = torch.float16
         args.mixed_precision = accelerator.mixed_precision
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
         args.mixed_precision = accelerator.mixed_precision
-
+        
+    if accelerator.is_main_process:
+        wandb.init(project='ctrlhoi',name=args.exp_name)
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -191,11 +216,18 @@ def main():
             )
             args.resume_from_checkpoint = None
             initial_global_step = 0
+        elif change_world_size:
+            accelerator.print(f"Resuming from checkpoint {path}")
+            state_dict= torch.load(os.path.join(args.output_dir, path, "controlnet.bin"))
+            state_dict = {"module."+k: v for k, v in state_dict.items()}
+            controlnet.load_state_dict(state_dict)
+            global_step = int(path.split("-")[1])
+            initial_global_step = global_step
+            first_epoch = global_step // num_update_steps_per_epoch
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             accelerator.load_state(os.path.join(args.output_dir, path))
             global_step = int(path.split("-")[1])
-
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
 
@@ -207,38 +239,42 @@ def main():
         desc="Steps",
         disable=not accelerator.is_local_main_process,
     )
-
+    
     global_step=initial_global_step
     if accelerator.is_main_process:
-        pipe = XFluxSampler(clip, t5, vae, dit, accelerator.unwrap_model(controlnet), accelerator.device)
+        pipe=XFluxSampler(clip,t5,vae,dit,accelerator.unwrap_model(controlnet),accelerator.device)
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
             with accelerator.accumulate(controlnet):
-                img, control_image, prompts = batch
-                control_image = control_image.to(accelerator.device)
+                img, mask,prompts,seg_mask = batch['video'].to(accelerator.device), batch['mask'].to(accelerator.device), batch['prompt'],batch['seg_mask'].to(accelerator.device)
                 with torch.no_grad():
                     x_1 = vae.encode(img.to(accelerator.device).to(torch.float32))
                     inp = prepare(t5=t5, clip=clip, img=x_1, prompt=prompts)
-
                     x_1 = rearrange(x_1, "b c (h ph) (w pw) -> b (h w) (c ph pw)", ph=2, pw=2)
+                    # normal=normal.to(torch.float32)
+                    # hand=hand.to(torch.float32)
+                    seg_mask=seg_mask.to(torch.float32)
+                    mask = get_down_mask(mask[:,0:1,:,:], 8)                   
 
                 bs = img.shape[0]
-                # t = torch.sigmoid(torch.randn((bs,), device=accelerator.device))
+                height,width=img.shape[2],img.shape[3]
                 t = torch.tensor([random.choice(timesteps) for _ in range(bs)]).to(accelerator.device)
-
                 x_0 = torch.randn_like(x_1).to(accelerator.device)
+                
                 print(t.shape, x_1.shape, x_0.shape)
                 x_t = (1 - t.unsqueeze(1).unsqueeze(2).repeat(1, x_1.shape[1], x_1.shape[2])) * x_1 + t.unsqueeze(1).unsqueeze(2).repeat(1, x_1.shape[1], x_1.shape[2]) * x_0
+                # conditions= torch.cat([seg_mask],dim=1)
+                conditions=seg_mask
                 guidance_vec = torch.full((x_t.shape[0],), 4, device=x_t.device, dtype=x_t.dtype)
-
+                
                 block_res_samples = controlnet(
                     img=x_t.to(weight_dtype),
                     img_ids=inp['img_ids'].to(weight_dtype),
-                    controlnet_cond=control_image.to(weight_dtype),
+                    controlnet_cond=conditions.to(weight_dtype),
                     txt=inp['txt'].to(weight_dtype),
                     txt_ids=inp['txt_ids'].to(weight_dtype),
-                    y=inp['vec'].to(weight_dtype),
+                    y=inp['y'].to(weight_dtype),
                     timesteps=t.to(weight_dtype),
                     guidance=guidance_vec.to(weight_dtype),
                 )
@@ -251,25 +287,19 @@ def main():
                     block_controlnet_hidden_states=[
                         sample.to(dtype=weight_dtype) for sample in block_res_samples
                     ],
-                    y=inp['vec'].to(weight_dtype),
+                    y=inp['y'].to(weight_dtype),
                     timesteps=t.to(weight_dtype),
                     guidance=guidance_vec.to(weight_dtype),
                 )
-
-                loss = F.mse_loss(model_pred.float(), (x_0 - x_1).float(), reduction="mean")
-
+                loss = get_loss(x_0-x_1,model_pred,mask)
+                # loss = F.mse_loss(model_pred.float(), (x_0 - x_1).float(), reduction="mean")
+                
                 # Gather the losses across all processes for logging (if we use distributed training).
                 avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
                 train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
-                # for n, p in controlnet.named_parameters():
-                #     if p.requires_grad:
-                #         if p.grad is not None:
-                #             print(n, p.grad.sum(), p.grad_fn)
-                #         else:
-                #             print(n, p.grad, p.grad_fn)
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(controlnet.parameters(), args.max_grad_norm)
                 optimizer.step()
@@ -279,9 +309,11 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 progress_bar.update(1)
+                global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
+                if accelerator.is_main_process:
+                    wandb.log(data={"train_loss": train_loss}, step=global_step)
                 train_loss = 0.0
-
                 if global_step % args.checkpointing_steps == 0:
                     if accelerator.is_main_process:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -311,22 +343,11 @@ def main():
 
                     torch.save(unwrapped_model.state_dict(), os.path.join(save_path, 'controlnet.bin'))
                     logger.info(f"Saved state to {save_path}")
-
-                if global_step % 1000 == 0 and accelerator.is_main_process:
+                if global_step% args.valid_iter == 1 and accelerator.is_main_process:
                     with torch.no_grad():
-                        image = pipe.infer_data(val_sample, seed=123, dtype=torch.float32)
-                        for tracker in accelerator.trackers:
-                            if tracker.name == 'wandb':
-                                tracker.log(
-                                    {
-                                        'validation':
-                                            wandb.Image(Image.fromarray(image))
-                                    },
-                                    step=global_step
-                                )
-                        Image.fromarray(image.astype(np.uint8)).save(f'results/train_{global_step:06d}.png')
-
-                global_step += 1
+                        for i,valid_sample in enumerate(valid_data):
+                            image=pipe.infer_data(valid_sample,seed=123,dtype=torch.float32)
+                            wandb.log({f'valid/image_{i}':wandb.Image(Image.fromarray(image))},step=global_step)
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

@@ -10,7 +10,7 @@ from huggingface_hub import hf_hub_download
 from safetensors import safe_open
 from safetensors.torch import load_file as load_sft
 
-from optimum.quanto import requantize
+# from optimum.quanto import requantize
 
 from .model import Flux, FluxParams
 from .controlnet import ControlNetFlux
